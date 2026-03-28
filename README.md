@@ -4,10 +4,10 @@ This project was inspired by the desire to improve F1 team/driver performance an
 
 ## What it does
 
-Utilizing bootstrapping and logistic regression, this project trains 200 models each to provide predictions for top 10 placements, podium placements, and winners. 
+Utilizing bootstrapping and logistic regression, this project trains 25-500 models to provide predictions for top 10 placements, podium placements, and winners. 
 
 ## How we built it
-
+We initially prototypes the necessary functions and graphs using a Google Colab Notebook. Then, we compiled the final draft into a Python script that uses Streamlit and Plotly as a front end.
 
 ## Challenges we ran into
 
