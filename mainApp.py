@@ -1,222 +1,475 @@
+import warnings
+warnings.filterwarnings("ignore")
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from collections import defaultdict
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 from sklearn.utils import resample
-from vroomies import remove_outliers, prepare_simulation_data, run_bootstrapped_simulations, calculate_win_probabilities, plot_win_probabilities
-
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="DataDrivers – F1 Prediction", page_icon="🏎️", layout="wide")
 st.title("DataDrivers")
 st.header("F1 Win Probability Simulator")
 
-# ── Data loading (cached so it only runs once) ─────────────────────────────────
+
+# ── Data loading ───────────────────────────────────────────────────────────────
 BASE_URL = "https://raw.githubusercontent.com/SZRoberson/CQ2026_DataTrack/main/data/"
 
 @st.cache_data(show_spinner="Loading F1 data...")
 def load_data():
-    lap_df  = pd.read_csv(BASE_URL + "LapTimes.csv")
-    race_df = pd.read_csv(BASE_URL + "RaceResults.csv")
+    lap_df       = pd.read_csv(BASE_URL + "LapTimes.csv")
+    race_results = pd.read_csv(BASE_URL + "RaceResults.csv")
     lap_df["LapTime"] = pd.to_timedelta(lap_df["LapTime"])
-    return lap_df, race_df
 
-lap_df, race_df = load_data()
+    # ── Feature engineering (mirrors vroomies.ipynb) ──────────────────────────
+    def to_min(t):
+        try:
+            return pd.to_timedelta(t).total_seconds() / 60
+        except:
+            return None
 
-# ── Functions from vroomies.ipynb ──────────────────────────────────────────────
+    def get_fastest_qualifying(row):
+        times = [to_min(row[col]) for col in ["Q1", "Q2", "Q3"]]
+        times = [t for t in times if t is not None]
+        return min(times) if times else None
 
-'''
-def remove_outliers(laptimes_observations):
-    """Remove lap time outliers using the IQR method."""
-    cleaned = {}
-    for entity_id, laptimes in laptimes_observations.items():
-        if len(laptimes) < 4:
-            cleaned[entity_id] = laptimes
+    race_results["Qual"]   = race_results.apply(get_fastest_qualifying, axis=1)
+    race_results["Race"]   = race_results["ElapsedTime"].apply(to_min)
+    race_results["Won"]    = (race_results["Position"] == 1).astype(int)
+    race_results["Podium"] = (race_results["Position"] <= 3).astype(int)
+    race_results["Top5"]   = (race_results["Position"] <= 5).astype(int)
+    race_results["Points"] = race_results["Points"].fillna(0)
+
+    return lap_df, race_results
+
+lap_df, race_results = load_data()
+
+# ── vroomies.ipynb functions (ported verbatim) ─────────────────────────────────
+
+def prepare_features_all(df):
+    """Prepare features for all historical data."""
+    features = pd.DataFrame()
+    features["qualifying_time"] = df["Qual"]
+    features["grid_position"]   = df["GridPosition"]
+    features["race_round"]      = df["Round"]
+    features = features.fillna(features.mean())
+    return features
+
+
+@st.cache_data(show_spinner="Training models…")
+def train_historical_models(_df_historical, n_bootstrap=200):
+    """Train bootstrapped logistic regression models on historical race data."""
+    X_historical = prepare_features_all(_df_historical)
+    models = {}
+    targets = {
+        "Win (1st)":       "Won",
+        "Podium (1st-3rd)": "Podium",
+        "Top 5":           "Top5",
+    }
+    for target_name, target_col in targets.items():
+        y_historical = _df_historical[target_col]
+        if y_historical.sum() < 3 or (len(y_historical) - y_historical.sum()) < 3:
+            models[target_name] = None
             continue
-        arr = np.array(laptimes)
-        Q1, Q3 = np.percentile(arr, 25), np.percentile(arr, 75)
-        IQR = Q3 - Q1
-        mask = (arr >= Q1 - 1.5 * IQR) & (arr <= Q3 + 1.5 * IQR)
-        cleaned[entity_id] = arr[mask].tolist()
-    return cleaned
-'''
 
-def prepare_simulation_data(lap_df, race_df, selected_event=None,
-                             analysis_type="driver", apply_outlier_removal=False):
-    """Load, filter, and structure lap times for drivers or teams."""
-    processed_lap  = lap_df.copy()
-    processed_race = race_df.copy()
+        model_list, scaler_list = [], []
+        for i in range(n_bootstrap):
+            indices = resample(range(len(X_historical)), n_samples=len(X_historical),
+                               replace=True, random_state=i)
+            X_boot = X_historical.iloc[indices]
+            y_boot = y_historical.iloc[indices]
+            if len(np.unique(y_boot)) < 2:
+                continue
+            scaler  = StandardScaler()
+            X_scaled = scaler.fit_transform(X_boot)
+            model   = LogisticRegression(max_iter=1000, random_state=i)
+            model.fit(X_scaled, y_boot)
+            model_list.append(model)
+            scaler_list.append(scaler)
 
-    if selected_event:
-        event_races  = processed_race[processed_race["Event Name"] == selected_event]
-        participants = event_races["DriverNumber"].unique()
-        processed_lap  = processed_lap[processed_lap["DriverNumber"].isin(participants)]
-        processed_race = event_races
+        models[target_name] = {
+            "models":   model_list,
+            "scalers":  scaler_list,
+            "features": X_historical.columns.tolist(),
+        }
+    return models
 
-    id_col, name_col = ("DriverNumber", "FullName") if analysis_type == "driver" else ("TeamId", "TeamName")
 
-    name_map = (
-        processed_race[[id_col, name_col]]
-        .drop_duplicates(subset=[id_col])
-        .set_index(id_col)[name_col]
-        .to_dict()
-    )
+def predict_race_outcomes(race_data, historical_models):
+    """Predict Win / Podium / Top-5 probabilities for each driver in a race."""
+    X_race = prepare_features_all(race_data)
+    all_predictions = {}
 
-    # lap_df only has DriverNumber — for team analysis, join TeamId in from race_df
-    if analysis_type == "team":
-        driver_to_team = (
-            processed_race[["DriverNumber", "TeamId", "TeamName"]]
-            .drop_duplicates(subset=["DriverNumber"])
+    for target_name, model_dict in historical_models.items():
+        if model_dict is None:
+            # Heuristic fallback
+            rc = race_data.copy()
+            rc["prob"] = 1 / (rc["GridPosition"] + 3)
+            rc["prob"] = rc["prob"] / rc["prob"].max()
+            pred_df = rc[["FullName", "DriverId", "TeamName", "GridPosition", "prob"]].copy()
+            pred_df["probability"] = pred_df["prob"]
+            pred_df["prob_lower"]  = pred_df["prob"]
+            pred_df["prob_upper"]  = pred_df["prob"]
+            all_predictions[target_name] = pred_df.sort_values("probability", ascending=False)
+            continue
+
+        all_probs = []
+        for model, scaler in zip(model_dict["models"], model_dict["scalers"]):
+            X_scaled = scaler.transform(X_race)
+            all_probs.append(model.predict_proba(X_scaled)[:, 1])
+
+        if not all_probs:
+            continue
+
+        all_probs  = np.array(all_probs)
+        mean_probs = np.mean(all_probs, axis=0)
+        lower_ci   = np.percentile(all_probs, 2.5,  axis=0)
+        upper_ci   = np.percentile(all_probs, 97.5, axis=0)
+
+        pred_df = race_data[["FullName", "DriverId", "TeamName", "GridPosition"]].copy()
+        pred_df["probability"] = mean_probs
+        pred_df["prob_lower"]  = lower_ci
+        pred_df["prob_upper"]  = upper_ci
+        all_predictions[target_name] = pred_df.sort_values("probability", ascending=False)
+
+    return all_predictions
+
+
+def filter_predictions(predictions, filter_type, filter_value):
+    """Filter predictions by Driver or Team (mirrors vroomies.ipynb)."""
+    filtered = {}
+    for target_name, pred_df in predictions.items():
+        if filter_type == "Driver":
+            filtered[target_name] = pred_df[pred_df["FullName"] == filter_value].copy()
+        elif filter_type == "Team":
+            filtered[target_name] = pred_df[pred_df["TeamName"] == filter_value].copy()
+        else:
+            filtered[target_name] = pred_df.copy()
+    return filtered
+
+
+def create_figure_list(predictions, race_data, filter_type="All", filter_value=None):
+    """
+    Build the figure_list exactly as in vroomies.ipynb.
+
+    filter_type : "All" | "Driver" | "Team"
+    Returns a list of up to 4–6 Plotly figures depending on filter mode.
+    """
+    figure_list = []
+
+    if filter_type != "All" and filter_value:
+        predictions = filter_predictions(predictions, filter_type, filter_value)
+
+    event_name = race_data["Event Name"].iloc[0]
+
+    # ── Figure 1: Win Probability ──────────────────────────────────────────────
+    if "Win (1st)" in predictions and len(predictions["Win (1st)"]) > 0:
+        win_probs = predictions["Win (1st)"].head(15)
+        if filter_type in ("Driver", "Team") and filter_value:
+            title1 = f"Win Probability – {filter_value}"
+        else:
+            title1 = f"Win Probability – {event_name}"
+
+        fig1 = px.bar(
+            win_probs, x="FullName", y="probability",
+            title=title1,
+            labels={"probability": "Probability", "FullName": "Driver"},
+            color="probability", color_continuous_scale="Viridis",
+            text=win_probs["probability"].apply(lambda x: f"{x:.1%}"),
         )
-        processed_lap = processed_lap.merge(driver_to_team, on="DriverNumber", how="left")
+        fig1.update_layout(height=500, showlegend=False)
+        fig1.update_traces(textposition="outside")
+        figure_list.append(fig1)
 
-    laptimes_obs = {}
-    for entity_id in processed_lap[id_col].unique():
-        laps_s = processed_lap[processed_lap[id_col] == entity_id]["LapTime"].dt.total_seconds().dropna()
-        if len(laps_s) > 0:
-            laptimes_obs[entity_id] = laps_s.tolist()
+    # ── Figure 2: Podium Probability ───────────────────────────────────────────
+    if "Podium (1st-3rd)" in predictions and len(predictions["Podium (1st-3rd)"]) > 0:
+        podium_probs = predictions["Podium (1st-3rd)"].head(15)
+        if filter_type in ("Driver", "Team") and filter_value:
+            title2 = f"Podium Probability – {filter_value}"
+        else:
+            title2 = f"Podium Probability – {event_name}"
 
-    if apply_outlier_removal:
-        laptimes_obs = remove_outliers(laptimes_obs)
+        fig2 = px.bar(
+            podium_probs, x="FullName", y="probability",
+            title=title2,
+            labels={"probability": "Probability", "FullName": "Driver"},
+            color="probability", color_continuous_scale="Plasma",
+            text=podium_probs["probability"].apply(lambda x: f"{x:.1%}"),
+        )
+        fig2.update_layout(height=500, showlegend=False)
+        fig2.update_traces(textposition="outside")
+        figure_list.append(fig2)
 
-    return laptimes_obs, name_map
+    # ── Figure 3: Top 5 Probability ────────────────────────────────────────────
+    if "Top 5" in predictions and len(predictions["Top 5"]) > 0:
+        top5_probs = predictions["Top 5"].head(15)
+        if filter_type in ("Driver", "Team") and filter_value:
+            title3 = f"Top 5 Probability – {filter_value}"
+        else:
+            title3 = f"Top 5 Probability – {event_name}"
+
+        fig3 = px.bar(
+            top5_probs, x="FullName", y="probability",
+            title=title3,
+            labels={"probability": "Probability", "FullName": "Driver"},
+            color="probability", color_continuous_scale="Inferno",
+            text=top5_probs["probability"].apply(lambda x: f"{x:.1%}"),
+        )
+        fig3.update_layout(height=500, showlegend=False)
+        fig3.update_traces(textposition="outside")
+        figure_list.append(fig3)
+
+    # ── Figure 4a: Win Probabilities with 95% CI (All view) ───────────────────
+    if filter_type == "All" and "Win (1st)" in predictions:
+        top_drivers = predictions["Win (1st)"].head(8).copy()
+
+        fig4 = go.Figure()
+        fig4.add_trace(go.Bar(
+            x=top_drivers["FullName"],
+            y=top_drivers["probability"],
+            name="Probability",
+            marker_color="steelblue",
+            text=top_drivers["probability"].apply(lambda x: f"{x:.1%}"),
+            textposition="outside",
+            error_y=dict(
+                type="data", symmetric=False,
+                array=top_drivers["prob_upper"] - top_drivers["probability"],
+                arrayminus=top_drivers["probability"] - top_drivers["prob_lower"],
+                color="gray", thickness=1,
+            ),
+        ))
+        fig4.update_layout(
+            title=f"Win Probabilities with 95% Confidence Intervals – {event_name}",
+            xaxis_title="", yaxis_title="Probability",
+            height=500, showlegend=False,
+        )
+        figure_list.append(fig4)
+
+    # ── Figure 4b: Outcome Probabilities for a single Driver ──────────────────
+    if filter_type == "Driver" and filter_value and "Win (1st)" in predictions:
+        driver_data = predictions["Win (1st)"]
+        if len(driver_data) > 0:
+            driver_row = driver_data.iloc[0]
+            categories = ["Win", "Podium", "Top 5"]
+            values = [
+                driver_row["probability"] * 100,
+                predictions["Podium (1st-3rd)"].iloc[0]["probability"] * 100
+                    if "Podium (1st-3rd)" in predictions and len(predictions["Podium (1st-3rd)"]) > 0 else 0,
+                predictions["Top 5"].iloc[0]["probability"] * 100
+                    if "Top 5" in predictions and len(predictions["Top 5"]) > 0 else 0,
+            ]
+            fig5 = go.Figure()
+            fig5.add_trace(go.Bar(
+                x=categories, y=values,
+                marker_color=["#FFD700", "#C0C0C0", "#CD7F32"],
+                text=[f"{v:.1f}%" for v in values],
+                textposition="auto",
+            ))
+            fig5.update_layout(
+                title=f"{filter_value} – Outcome Probabilities",
+                yaxis_title="Probability (%)",
+                yaxis_range=[0, 100],
+                height=400,
+            )
+            figure_list.append(fig5)
+
+    # ── Figure 4c: Team driver comparison ─────────────────────────────────────
+    if filter_type == "Team" and filter_value and "Win (1st)" in predictions:
+        team_data = predictions["Win (1st)"]
+        if len(team_data) > 0:
+            team_drivers = team_data[["FullName", "probability"]].copy()
+            if "Podium (1st-3rd)" in predictions:
+                team_drivers = team_drivers.copy()
+                team_drivers["podium"] = predictions["Podium (1st-3rd)"]["probability"].values
+            if "Top 5" in predictions:
+                team_drivers["top5"] = predictions["Top 5"]["probability"].values
+
+            fig6 = go.Figure()
+            fig6.add_trace(go.Bar(name="Win",    x=team_drivers["FullName"],
+                                  y=team_drivers["probability"] * 100, marker_color="#FFD700"))
+            if "podium" in team_drivers.columns:
+                fig6.add_trace(go.Bar(name="Podium", x=team_drivers["FullName"],
+                                      y=team_drivers["podium"] * 100, marker_color="#C0C0C0"))
+            if "top5" in team_drivers.columns:
+                fig6.add_trace(go.Bar(name="Top 5",  x=team_drivers["FullName"],
+                                      y=team_drivers["top5"] * 100, marker_color="#CD7F32"))
+            fig6.update_layout(
+                title=f"{filter_value} – Driver Comparison",
+                yaxis_title="Probability (%)",
+                barmode="group", height=500,
+            )
+            figure_list.append(fig6)
+
+    return figure_list
 
 
-def simulate_bootstrapped_race(driver_laptimes, num_laps=60):
-    """Simulate one race by bootstrap-sampling lap times."""
-    if not driver_laptimes:
-        return float("inf")
-    return sum(resample(driver_laptimes, n_samples=num_laps, replace=True))
-
-
-def run_bootstrapped_simulations(laptimes_obs_dict, num_laps, num_simulations):
-    """Run the full bootstrap simulation loop and return win counts."""
-    win_counts = defaultdict(int)
-    for _ in range(num_simulations):
-        results = {eid: simulate_bootstrapped_race(lt, num_laps) for eid, lt in laptimes_obs_dict.items()}
-        if results:
-            win_counts[min(results, key=results.get)] += 1
-    return win_counts
-
-
-def calculate_win_probabilities(win_counts, num_simulations, name_map, target_id=None):
-    """Convert win counts to a sorted probability DataFrame, or a single float if target_id given."""
-    probs = {eid: cnt / num_simulations for eid, cnt in win_counts.items()}
-    df = pd.DataFrame(list(probs.items()), columns=["ID", "WinProbability"])
-    df["Name"] = df["ID"].map(name_map).fillna(df["ID"].astype(str))
-    df = df.sort_values("WinProbability", ascending=False).reset_index(drop=True)
-
-    if target_id is not None:
-        row = df[df["ID"] == target_id]
-        return float(row["WinProbability"].iloc[0]) if not row.empty else 0.0
-    return df
-
-
-def plot_win_probabilities(prob_df, title):
-    """Return a Plotly bar chart of win probabilities."""
-    fig = px.bar(
-        prob_df, x="Name", y="WinProbability",
-        title=title,
-        labels={"Name": "Driver / Team", "WinProbability": "Win Probability"},
-        color="Name", text="WinProbability", template="ggplot2",
-    )
-    fig.update_traces(texttemplate="%{y:.1%}", textposition="outside")
-    fig.update_layout(
-        xaxis_tickangle=-45,
-        yaxis=dict(tickformat=".0%"),
-        showlegend=False,
-        height=520,
-    )
-    return fig
-
-# ── Sidebar controls (parameters sent into the simulation) ─────────────────────
+# ── Sidebar ────────────────────────────────────────────────────────────────────
 st.sidebar.title("⚙️ Simulation Settings")
 
-analysis_type = st.sidebar.radio(
-    "Analysis Type",
-    options=["driver", "team"],
-    format_func=lambda x: "Racer" if x == "driver" else "Team",
-    help="Simulate individual racer probabilities or team probabilities.",
+all_events = sorted(race_results["Event Name"].dropna().unique().tolist())
+selected_event = st.sidebar.selectbox(
+    "Grand Prix",
+    options=all_events,
+    index=len(all_events) - 1,
+    help="The race used for predictions. Training uses all earlier rounds.",
 )
 
-all_events    = sorted(race_df["Event Name"].dropna().unique().tolist())
-selected_event_raw = st.sidebar.selectbox(
-    "Event Filter",
-    options=["All Events"] + all_events,
-    help="Filter lap data to one Grand Prix, or use the full season.",
-)
-selected_event = None if selected_event_raw == "All Events" else selected_event_raw
-
-num_laps = st.sidebar.slider(
-    "Race Laps", min_value=30, max_value=78, value=60, step=1,
+n_bootstrap = st.sidebar.select_slider(
+    "Bootstrap Iterations",
+    options=[50, 100, 200, 500],
+    value=200,
+    help="More iterations = more stable probabilities, but slower.",
 )
 
-num_simulations = st.sidebar.select_slider(
-    "Bootstrap Simulations",
-    options=[100, 500, 1_000, 5_000, 10_000],
-    value=1_000,
-    help="More simulations = more accurate, but slower.",
+run_btn = st.sidebar.button("▶ Run Prediction", type="primary", use_container_width=True)
+
+st.sidebar.divider()
+st.sidebar.subheader("📊 Results Filter")
+
+filter_mode = st.sidebar.radio(
+    "Show",
+    options=["No Filter", "All Drivers", "By Driver", "By Team"],
+    help=(
+        "No Filter / All Drivers → ranked bar charts for everyone.\n"
+        "By Driver → spotlights one driver across all 4 outcome types.\n"
+        "By Team → compares both team drivers side-by-side."
+    ),
 )
 
-apply_outlier_removal = st.sidebar.toggle(
-    "Remove Outlier Laps (IQR)",
-    value=False,
-    help="Removes laps outside Q1 ± 1.5×IQR before simulating.",
-)
+filter_value = None
+if filter_mode == "By Driver":
+    all_drivers  = sorted(race_results["FullName"].dropna().unique().tolist())
+    filter_value = st.sidebar.selectbox("Select Driver", options=all_drivers)
+elif filter_mode == "By Team":
+    all_teams    = sorted(race_results["TeamName"].dropna().unique().tolist())
+    filter_value = st.sidebar.selectbox("Select Team", options=all_teams)
 
-run_btn = st.sidebar.button("▶ Run Simulation", type="primary", use_container_width=True)
+# map sidebar filter_mode → vroomies filter_type string
+FILTER_TYPE_MAP = {
+    "No Filter":   "All",
+    "All Drivers": "All",
+    "By Driver":   "Driver",
+    "By Team":     "Team",
+}
+filter_type = FILTER_TYPE_MAP[filter_mode]
 
-# ── Run simulation ─────────────────────────────────────────────────────────────
+# ── Status caption ─────────────────────────────────────────────────────────────
 st.caption(
-    f"**{analysis_type.title()}** · Event: **{selected_event_raw}** · "
-    f"**{num_laps}** laps · **{num_simulations:,}** simulations · "
-    f"Outlier removal: **{'On' if apply_outlier_removal else 'Off'}**"
+    f"Event: **{selected_event}** · "
+    f"**{n_bootstrap}** bootstrap iterations · "
+    f"Filter: **{filter_mode}**"
+    + (f" → *{filter_value}*" if filter_value else "")
 )
 
-if "results_df" not in st.session_state or run_btn:
-    with st.spinner("Running bootstrap simulation…"):
-        laptimes_obs, name_map = prepare_simulation_data(
-            lap_df, race_df,
-            selected_event=selected_event,
-            analysis_type=analysis_type,
-            apply_outlier_removal=apply_outlier_removal,
+# ── Run pipeline ───────────────────────────────────────────────────────────────
+cache_key = (selected_event, n_bootstrap)
+
+if "predictions" not in st.session_state or \
+   st.session_state.get("cache_key") != cache_key or \
+   run_btn:
+
+    # Determine the round number for the selected event
+    target_round = race_results.loc[
+        race_results["Event Name"] == selected_event, "Round"
+    ].iloc[0]
+
+    df_clean = race_results.dropna(subset=["Qual", "Race"]).copy()
+
+    historical_data  = df_clean[df_clean["Round"] < target_round].copy()
+    race_to_predict  = df_clean[df_clean["Round"] == target_round].copy()
+
+    if historical_data.empty:
+        st.error("Not enough historical races before this event to train a model. "
+                 "Please select a later Grand Prix.")
+        st.stop()
+
+    if race_to_predict.empty:
+        st.error("No qualifying/race data found for this event.")
+        st.stop()
+
+    with st.spinner("Training models and generating predictions…"):
+        historical_models = train_historical_models(historical_data, n_bootstrap=n_bootstrap)
+        predictions       = predict_race_outcomes(race_to_predict, historical_models)
+
+    st.session_state.predictions      = predictions
+    st.session_state.race_to_predict  = race_to_predict
+    st.session_state.cache_key        = cache_key
+
+predictions     = st.session_state.predictions
+race_to_predict = st.session_state.race_to_predict
+
+# ── Build figure_list (mirrors vroomies.ipynb exactly) ────────────────────────
+figure_list = create_figure_list(
+    predictions, race_to_predict,
+    filter_type=filter_type,
+    filter_value=filter_value,
+)
+
+# ── Display all figures ────────────────────────────────────────────────────────
+if not figure_list:
+    st.warning(
+        f"No figures to display for **{filter_value}** with the current filter. "
+        "They may not have qualifying data for this event. Try 'No Filter' or a different event."
+    )
+else:
+    TITLES = {
+        "All": [
+            "🏆 Win Probability",
+            "🥇 Podium Probability (Top 3)",
+            "🔝 Top 5 Probability",
+            "📊 Win Probabilities with 95% Confidence Intervals",
+        ],
+        "Driver": [
+            "🏆 Win Probability",
+            "🥇 Podium Probability (Top 3)",
+            "🔝 Top 5 Probability",
+            "📊 Outcome Probabilities",
+        ],
+        "Team": [
+            "🏆 Win Probability",
+            "🥇 Podium Probability (Top 3)",
+            "🔝 Top 5 Probability",
+            "📊 Driver Comparison",
+        ],
+    }
+    section_titles = TITLES.get(filter_type, TITLES["All"])
+
+    for i, fig in enumerate(figure_list):
+        label = section_titles[i] if i < len(section_titles) else f"Figure {i + 1}"
+        st.subheader(label)
+        st.plotly_chart(fig, use_container_width=True)
+
+# ── Raw predictions table ──────────────────────────────────────────────────────
+with st.expander("📋 Full prediction table (Win probability, all drivers)"):
+    if "Win (1st)" in predictions:
+        tbl = predictions["Win (1st)"][["FullName", "TeamName", "GridPosition", "probability",
+                                        "prob_lower", "prob_upper"]].copy()
+        tbl.columns = ["Driver", "Team", "Grid", "Win Prob", "Lower 95%", "Upper 95%"]
+        st.dataframe(
+            tbl.style.format({
+                "Win Prob": "{:.2%}", "Lower 95%": "{:.2%}", "Upper 95%": "{:.2%}"
+            }),
+            use_container_width=True, hide_index=True,
         )
-        win_counts = run_bootstrapped_simulations(laptimes_obs, num_laps, num_simulations)
-        prob_df    = calculate_win_probabilities(win_counts, num_simulations, name_map)
 
-    st.session_state.results_df   = prob_df
-    st.session_state.results_meta = dict(
-        analysis_type=analysis_type,
-        selected_event=selected_event_raw,
-    )
-
-prob_df = st.session_state.results_df
-meta    = st.session_state.results_meta
-
-# ── Chart ──────────────────────────────────────────────────────────────────────
-label     = "Drivers" if meta["analysis_type"] == "driver" else "Constructors"
-fig_title = f"Bootstrapped Win Probabilities – {label} ({meta['selected_event']})"
-st.plotly_chart(plot_win_probabilities(prob_df, fig_title), use_container_width=True)
-
-# ── Raw data table ─────────────────────────────────────────────────────────────
-with st.expander("📋 Full probability table"):
-    st.dataframe(
-        prob_df[["Name", "WinProbability"]]
-        .rename(columns={"Name": "Driver / Team", "WinProbability": "Win Probability"})
-        .style.format({"Win Probability": "{:.2%}"}),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-# ── Single-entity lookup ───────────────────────────────────────────────────────
+# ── Search lookup ──────────────────────────────────────────────────────────────
 st.divider()
-st.subheader("Search for Racer / Team")
-t
-selected_name = st.selectbox("Select entry", options=prob_df["Name"].tolist())
-if selected_name:
-    row = prob_df[prob_df["Name"] == selected_name].iloc[0]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Name",            row["Name"])
-    c2.metric("ID",              str(row["ID"]))
-    c3.metric("Win Probability", f"{row['WinProbability']:.2%}")
+st.subheader("🔎 Search for Racer / Team")
+
+if "Win (1st)" in predictions:
+    all_names     = predictions["Win (1st)"]["FullName"].tolist()
+    selected_name = st.selectbox("Select entry", options=all_names)
+
+    if selected_name:
+        row = predictions["Win (1st)"][predictions["Win (1st)"]["FullName"] == selected_name].iloc[0]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Driver",           row["FullName"])
+        c2.metric("Team",             row["TeamName"])
+        c3.metric("Grid Position",    str(int(row["GridPosition"])))
+        c4.metric("Win Probability",  f"{row['probability']:.2%}")
