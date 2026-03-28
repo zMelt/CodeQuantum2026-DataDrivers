@@ -267,7 +267,7 @@ def create_figure_list(predictions, race_data, filter_type="All", filter_value=N
             fig5 = go.Figure()
             fig5.add_trace(go.Bar(
                 x=categories, y=values,
-                marker_color=["#FFD700", "#C0C0C0", "#CD7F32"],
+                marker_color=["#FEC11A", "#C0C0C0", "#CD7F32"],
                 text=[f"{v:.1f}%" for v in values],
                 textposition="auto",
             ))
@@ -300,7 +300,7 @@ def create_figure_list(predictions, race_data, filter_type="All", filter_value=N
                 fig6.add_trace(go.Bar(name="Top 5",  x=team_drivers["FullName"],
                                       y=team_drivers["top5"] * 100, marker_color="#CD7F32"))
             fig6.update_layout(
-                title=f"{filter_value} – Driver Comparison",
+                title=f"{filter_value} – Racer Comparison",
                 yaxis_title="Probability (%)",
                 barmode="group", height=500,
             )
@@ -310,11 +310,11 @@ def create_figure_list(predictions, race_data, filter_type="All", filter_value=N
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
-st.sidebar.title("⚙️ Simulation Settings")
+st.sidebar.title("Simulation Settings")
 
 all_events = sorted(race_results["Event Name"].dropna().unique().tolist())
 selected_event = st.sidebar.selectbox(
-    "Grand Prix",
+    "Track",
     options=all_events,
     index=len(all_events) - 1,
     help="The race used for predictions. Training uses all earlier rounds.",
@@ -322,30 +322,31 @@ selected_event = st.sidebar.selectbox(
 
 n_bootstrap = st.sidebar.select_slider(
     "Bootstrap Iterations",
-    options=[50, 100, 200, 500],
-    value=200,
+    # values from 25 to 500 in increments of 5
+    options=list(range(25, 505, 5)),
+    value=250,
     help="More iterations = more stable probabilities, but slower.",
 )
 
 run_btn = st.sidebar.button("▶ Run Prediction", type="primary", use_container_width=True)
 
 st.sidebar.divider()
-st.sidebar.subheader("📊 Results Filter")
+st.sidebar.subheader("Results Filter")
 
 filter_mode = st.sidebar.radio(
     "Show",
-    options=["No Filter", "All Drivers", "By Driver", "By Team"],
+    options=["No Filter", "All Racers", "By Racer", "By Team"],
     help=(
-        "No Filter / All Drivers → ranked bar charts for everyone.\n"
-        "By Driver → spotlights one driver across all 4 outcome types.\n"
+        "No Filter / All Racer → ranked bar charts for everyone.\n"
+        "By Racer → spotlights one racer across all 4 outcome types.\n"
         "By Team → compares both team drivers side-by-side."
     ),
 )
 
 filter_value = None
-if filter_mode == "By Driver":
-    all_drivers  = sorted(race_results["FullName"].dropna().unique().tolist())
-    filter_value = st.sidebar.selectbox("Select Driver", options=all_drivers)
+if filter_mode == "By Racer":
+    all_racers  = sorted(race_results["FullName"].dropna().unique().tolist())
+    filter_value = st.sidebar.selectbox("Select Racer", options=all_racers)
 elif filter_mode == "By Team":
     all_teams    = sorted(race_results["TeamName"].dropna().unique().tolist())
     filter_value = st.sidebar.selectbox("Select Team", options=all_teams)
@@ -353,8 +354,8 @@ elif filter_mode == "By Team":
 # map sidebar filter_mode → vroomies filter_type string
 FILTER_TYPE_MAP = {
     "No Filter":   "All",
-    "All Drivers": "All",
-    "By Driver":   "Driver",
+    "All Racers": "All",
+    "By Racer":   "Driver",
     "By Team":     "Team",
 }
 filter_type = FILTER_TYPE_MAP[filter_mode]
@@ -386,7 +387,7 @@ if "predictions" not in st.session_state or \
 
     if historical_data.empty:
         st.error("Not enough historical races before this event to train a model. "
-                 "Please select a later Grand Prix.")
+                 "Please select a later Track.")
         st.stop()
 
     if race_to_predict.empty:
@@ -420,22 +421,22 @@ if not figure_list:
 else:
     TITLES = {
         "All": [
-            "🏆 Win Probability",
-            "🥇 Podium Probability (Top 3)",
-            "🔝 Top 5 Probability",
-            "📊 Win Probabilities with 95% Confidence Intervals",
+            "Win Probability",
+            "Podium Probability (Top 3)",
+            "Podium Probability (Top 5)",
+            "Win Probabilities (95% Confidence Interval)",
         ],
-        "Driver": [
-            "🏆 Win Probability",
-            "🥇 Podium Probability (Top 3)",
-            "🔝 Top 5 Probability",
-            "📊 Outcome Probabilities",
+        "Racer": [
+            "Win Probability",
+            "Podium Probability (Top 3)",
+            "Podium Probability (Top 5)",
+            "Outcome Probabilities",
         ],
         "Team": [
-            "🏆 Win Probability",
-            "🥇 Podium Probability (Top 3)",
-            "🔝 Top 5 Probability",
-            "📊 Driver Comparison",
+            "Win Probability",
+            "Podium Probability (Top 3)",
+            "Podium Probability (Top 5)",
+            "Racer Comparison",
         ],
     }
     section_titles = TITLES.get(filter_type, TITLES["All"])
@@ -446,11 +447,11 @@ else:
         st.plotly_chart(fig, use_container_width=True)
 
 # ── Raw predictions table ──────────────────────────────────────────────────────
-with st.expander("📋 Full prediction table (Win probability, all drivers)"):
+with st.expander("Full prediction table (Win probability, all drivers)"):
     if "Win (1st)" in predictions:
         tbl = predictions["Win (1st)"][["FullName", "TeamName", "GridPosition", "probability",
                                         "prob_lower", "prob_upper"]].copy()
-        tbl.columns = ["Driver", "Team", "Grid", "Win Prob", "Lower 95%", "Upper 95%"]
+        tbl.columns = ["Racer", "Team", "Grid", "Win %", "Lower 95%", "Upper 95%"]
         st.dataframe(
             tbl.style.format({
                 "Win Prob": "{:.2%}", "Lower 95%": "{:.2%}", "Upper 95%": "{:.2%}"
@@ -460,7 +461,7 @@ with st.expander("📋 Full prediction table (Win probability, all drivers)"):
 
 # ── Search lookup ──────────────────────────────────────────────────────────────
 st.divider()
-st.subheader("🔎 Search for Racer / Team")
+st.subheader("Search for Racer")
 
 if "Win (1st)" in predictions:
     all_names     = predictions["Win (1st)"]["FullName"].tolist()
@@ -469,7 +470,7 @@ if "Win (1st)" in predictions:
     if selected_name:
         row = predictions["Win (1st)"][predictions["Win (1st)"]["FullName"] == selected_name].iloc[0]
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Driver",           row["FullName"])
+        c1.metric("Racer",           row["FullName"])
         c2.metric("Team",             row["TeamName"])
         c3.metric("Grid Position",    str(int(row["GridPosition"])))
         c4.metric("Win Probability",  f"{row['probability']:.2%}")
